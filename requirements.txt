@@ -1,0 +1,6 @@
+pandas
+openpyxl
+selenium
+pywin32
+premailer
+holidays
