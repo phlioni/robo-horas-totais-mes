@@ -2,8 +2,36 @@
 import pandas as pd
 from datetime import datetime
 import feriados
+import config
 
-# MODIFICADO: A função agora também filtra os dados pelo período.
+def get_pessoas_ativas():
+    """
+    Lê a lista de pessoas ativas a partir do arquivo CSV/Excel definido no config.
+    """
+    try:
+        print(f"Lendo arquivo de pessoas ativas de: {config.CAMINHO_PESSOAS_ATIVAS}")
+        
+        if config.CAMINHO_PESSOAS_ATIVAS.endswith('.xlsx'):
+             df_ativas = pd.read_excel(config.CAMINHO_PESSOAS_ATIVAS, engine='openpyxl')
+        else:
+             df_ativas = pd.read_csv(config.CAMINHO_PESSOAS_ATIVAS, encoding='latin-1')
+
+        df_ativas.columns = df_ativas.columns.str.strip()
+        
+        if 'Nome' not in df_ativas.columns:
+            raise ValueError("A coluna 'Nome' não foi encontrada no arquivo de pessoas ativas.")
+        
+        df_ativas['Profissional'] = df_ativas['Nome'].str.strip()
+        
+        print(f"Encontradas {len(df_ativas)} pessoas ativas.")
+        return df_ativas[['Profissional']]
+    except FileNotFoundError:
+        print(f"ERRO CRÍTICO: O arquivo de pessoas ativas não foi encontrado em '{config.CAMINHO_PESSOAS_ATIVAS}'. Verifique o nome e o local do arquivo.")
+        raise
+    except Exception as e:
+        print(f"ERRO ao ler o arquivo de pessoas ativas: {e}")
+        raise
+
 def processar_planilha(caminho_arquivo, start_date, end_date):
     """Lê, limpa e filtra o relatório de horas baixado para o período de análise."""
     print(f"Processando a planilha e filtrando dados entre {start_date.strftime('%d/%m/%Y')} e {end_date.strftime('%d/%m/%Y')}...")
@@ -19,103 +47,69 @@ def processar_planilha(caminho_arquivo, start_date, end_date):
         df['Data'] = pd.to_datetime(df['Data'], format='%d/%m/%Y', errors='coerce')
         df.dropna(subset=['Data', 'Profissional'], inplace=True)
         
-        # NOVO: Filtra o DataFrame para incluir apenas as datas no período de análise
-        df = df[(df['Data'] >= pd.to_datetime(start_date)) & (df['Data'] <= pd.to_datetime(end_date))]
+        print("Filtrando o relatório para manter apenas as horas com situação 'Aprovado'.")
+        df_aprovado = df[df['Situação'].str.strip() == 'Aprovado'].copy()
         
-        df['Profissional'] = df['Profissional'].astype(str).str.strip()
-        df = df[df['Profissional'] != '']
+        df_filtrado = df_aprovado[(df_aprovado['Data'] >= pd.to_datetime(start_date)) & (df_aprovado['Data'] <= pd.to_datetime(end_date))].copy()
         
-        print("Planilha processada, filtrada e limpa com sucesso.")
-        return df
+        df_filtrado['Profissional'] = df_filtrado['Profissional'].str.strip()
+        df_filtrado['Horas'] = pd.to_numeric(df_filtrado['Horas'], errors='coerce').fillna(0)
+        
+        print("Processamento da planilha concluído.")
+        return df_filtrado
+
     except Exception as e:
-        print(f"ERRO CRÍTICO ao processar a planilha: {e}")
-        raise e
+        print(f"ERRO ao processar a planilha: {e}")
+        raise
 
-# MODIFICADO: Função reescrita para analisar o período específico.
-def analisar_horas_periodo(df_filtrado, start_date, end_date):
+def gerar_resumo_e_html(df_filtrado, start_date, end_date):
     """
-    Analisa os dados do período e cria um DataFrame consolidado.
+    Cria o DataFrame de RESUMO e o corpo HTML do e-mail, incluindo a tabela de totais.
     """
-    print("Iniciando análise de horas para o período...")
+    print("Gerando resumo de horas por profissional...")
     
-    # Cálculo de horas úteis para o período de análise
-    horas_uteis_periodo = feriados.get_horas_uteis_no_periodo(start_date, end_date)
+    horas_esperadas_periodo = feriados.get_horas_uteis_no_periodo(start_date, end_date)
+    
+    if not df_filtrado.empty:
+        resumo_profissionais = df_filtrado.groupby('Profissional')['Horas'].sum().reset_index()
+        resumo_profissionais.rename(columns={'Horas': 'Horas Aprovadas'}, inplace=True)
+    else:
+        resumo_profissionais = pd.DataFrame(columns=['Profissional', 'Horas Aprovadas'])
 
-    # DataFrame base com horas lançadas
-    df_consolidado = df_filtrado.groupby('Profissional').agg(
-        Horas_Lancadas=('Horas', 'sum')
-    ).reset_index()
+    df_pessoas_ativas = get_pessoas_ativas()
+    df_resumo_completo = pd.merge(df_pessoas_ativas, resumo_profissionais, on='Profissional', how='left')
+    df_resumo_completo['Horas Aprovadas'] = df_resumo_completo['Horas Aprovadas'].fillna(0)
+    df_resumo_completo['Total Horas Esperadas'] = horas_esperadas_periodo
+    df_resumo_completo['Total Saldo'] = df_resumo_completo['Horas Aprovadas'] - df_resumo_completo['Total Horas Esperadas']
+    df_resumo_completo.sort_values(by='Profissional', inplace=True)
+    
+    print("Resumo final gerado. Convertendo para HTML...")
+    html_table_individual = dataframe_to_html(df_resumo_completo)
 
-    # Adiciona colunas relevantes para o período
-    df_consolidado['Horas_Esperadas_Periodo'] = horas_uteis_periodo
-    df_consolidado['Saldo_Periodo'] = df_consolidado['Horas_Lancadas'] - df_consolidado['Horas_Esperadas_Periodo']
-    
-    # Organiza a ordem das colunas para melhor visualização
-    ordem_colunas = [
-        'Profissional',
-        'Horas_Lancadas',
-        'Horas_Esperadas_Periodo',
-        'Saldo_Periodo'
-    ]
-    df_consolidado = df_consolidado[ordem_colunas]
-    
-    print(f"Análise do período concluída para {len(df_consolidado)} profissionais.")
-    return df_consolidado, horas_uteis_periodo
+    total_aprovadas = df_resumo_completo['Horas Aprovadas'].sum()
+    total_esperadas = df_resumo_completo['Total Horas Esperadas'].sum()
+    saldo_geral = df_resumo_completo['Total Saldo'].sum()
+    html_table_geral = criar_html_resumo_geral(total_aprovadas, total_esperadas, saldo_geral)
 
-# MODIFICADO: Função reescrita para criar o novo corpo de e-mail.
-def criar_corpo_email_resumo(df_consolidado, horas_uteis_periodo, report_title):
-    """Cria o corpo do e-mail com a tabela consolidada do período."""
-    print("Gerando corpo do e-mail consolidado...")
-    
-    data_extracao_str = datetime.now().strftime('%d/%m/%Y às %H:%M')
-    titulo_email = f"Resumo de Apontamento de Horas - {report_title}"
-    
-    texto_principal = f"""
-    <p>Prezados,</p>
-    <p>Segue abaixo o resumo consolidado do status de apontamento de horas para o período de <b>{report_title}</b>.</p>
-    <p>Este relatório foi gerado em <b>{data_extracao_str}</b> e considera um total de <b>{horas_uteis_periodo} horas úteis</b> no período.</p>
-    """
-    
-    tabela_principal_html = _gerar_tabela_html("Resumo de Apontamentos", df_consolidado)
-
-    total_lancado = df_consolidado['Horas_Lancadas'].sum()
-    total_esperado = df_consolidado['Horas_Esperadas_Periodo'].sum()
-    total_saldo = df_consolidado['Saldo_Periodo'].sum()
-    df_total = pd.DataFrame([{'Total_Horas_Lancadas': total_lancado, 'Total_Horas_Esperadas': total_esperado, 'Total_Saldo': total_saldo}])
-    tabela_totais_html = _gerar_tabela_html("Totalizador Geral do Período", df_total)
-
-    return f"""
+    corpo_html = f"""
     <html>
-    <body style="font-family: 'Calibri', sans-serif; font-size: 11pt; color: #333;">
-        <h2>{titulo_email}</h2>
-        {texto_principal}
-        <hr style="border: 0; border-top: 1px solid #ccc; margin: 20px 0;">
-        {tabela_principal_html}
-        {tabela_totais_html}
-        <p><i>Este e-mail foi gerado automaticamente pelo robô.</i></p>
-    </body>
+        <body style="font-family: Calibri, sans-serif;">
+            <h2>Resumo de Apontamento de Horas</h2>
+            <p>Olá,</p>
+            <p>Segue abaixo o resumo de horas aprovadas para o período de <b>{start_date.strftime('%d/%m/%Y')}</b> a <b>{end_date.strftime('%d/%m/%Y')}</b>.</p>
+            <p>Para análise e filtros, utilize o relatório completo em anexo.</p>
+            {html_table_individual}
+            {html_table_geral}
+            <br>
+            <p>Este é um e-mail automático enviado pelo Robô de Apontamento de Horas.</p>
+        </body>
     </html>
     """
+    
+    return df_resumo_completo, corpo_html
 
-def _gerar_tabela_html(titulo, df):
-    """Função auxiliar para criar uma tabela HTML com estilos e nomes de colunas em pt-BR."""
-    if df.empty:
-        return f'<h3 style="font-family: Calibri, sans-serif;">{titulo}</h3><p>Nenhum registro encontrado.</p>'
-
-    df = df.copy()
-
-    # MODIFICADO: Novo mapa de colunas, removendo as colunas de Mês.
-    mapa_colunas = {
-        'Profissional': 'Profissional',
-        'Horas_Lancadas': 'Horas Lançadas',
-        'Horas_Esperadas_Periodo': 'Horas Esperadas (Período)',
-        'Saldo_Periodo': 'Saldo (Período)',
-        'Total_Horas_Lancadas': 'Total Horas Lançadas',
-        'Total_Horas_Esperadas': 'Total Horas Esperadas',
-        'Total_Saldo': 'Total Saldo'
-    }
-    df.rename(columns=mapa_colunas, inplace=True)
-
+def dataframe_to_html(df):
+    """Converte um DataFrame pandas para uma string de tabela HTML com estilos."""
     style_table = 'width: auto; max-width: 800px; border-collapse: collapse; font-family: Calibri, sans-serif; font-size: 11pt; margin-bottom: 25px;'
     style_th = 'background-color: #4472C4; color: #ffffff; padding: 12px 15px; text-align: left; font-weight: bold; border: 1px solid #dddddd;'
     style_td = 'padding: 12px 15px; text-align: left; border: 1px solid #dddddd;'
@@ -128,18 +122,112 @@ def _gerar_tabela_html(titulo, df):
     for index, row in df.iterrows():
         tr_style = style_tr_even if index % 2 == 0 else ''
         row_html = f'<tr style="{tr_style}">'
-        for cell_value in row:
-            if isinstance(cell_value, (int, float)):
-                 cell_value = f"{cell_value:,.2f}".replace(',', 'v').replace('.', ',').replace('v', '.')
-            row_html += f'<td style="{style_td}">{cell_value}</td>'
+        for col_name, cell_value in row.items():
+            align_style = 'text-align: right;' if isinstance(cell_value, (int, float)) else 'text-align: left;'
+            color_style = ''
+            if col_name == 'Total Saldo':
+                if cell_value < 0:
+                    color_style = 'color: red; font-weight: bold;'
+                elif cell_value > 0:
+                    color_style = 'color: green; font-weight: bold;'
+            final_style = f"{style_td} {align_style} {color_style}"
+            cell_display = f'{cell_value:.2f}' if isinstance(cell_value, (int, float)) else cell_value
+            row_html += f'<td style="{final_style}">{cell_display}</td>'
         row_html += '</tr>'
         html_body_rows.append(row_html)
+        
     html_body = f'<tbody>{"".join(html_body_rows)}</tbody>'
+    return f'<table style="{style_table}">{html_header}{html_body}</table>'
+
+def criar_html_resumo_geral(total_aprovadas, total_esperadas, saldo_geral):
+    """Cria uma tabela HTML formatada para o resumo geral da equipe."""
+    style_table_geral = 'width: auto; max-width: 450px; border-collapse: collapse; font-family: Calibri, sans-serif; font-size: 11pt; margin-top: 25px;'
+    style_td_label = 'padding: 10px 15px; text-align: left; border: 1px solid #dddddd; font-weight: bold;'
+    style_td_valor = 'padding: 10px 15px; text-align: right; border: 1px solid #dddddd;'
+    
+    saldo_color_style = ''
+    if saldo_geral < 0:
+        saldo_color_style = 'color: red; font-weight: bold;'
+    elif saldo_geral > 0:
+        saldo_color_style = 'color: green; font-weight: bold;'
 
     return f"""
-    <h3 style="font-family: Calibri, sans-serif;">{titulo}</h3>
-    <table style="{style_table}">
-        {html_header}
-        {html_body}
+    <h3 style="font-family: Calibri, sans-serif; margin-top: 30px;">Resumo Geral da Equipe</h3>
+    <table style="{style_table_geral}">
+        <tbody>
+            <tr>
+                <td style="{style_td_label}">Total de Horas Aprovadas</td>
+                <td style="{style_td_valor}">{total_aprovadas:.2f}</td>
+            </tr>
+            <tr style="background-color: #f8f8f8;">
+                <td style="{style_td_label}">Total de Horas Esperadas</td>
+                <td style="{style_td_valor}">{total_esperadas:.2f}</td>
+            </tr>
+            <tr>
+                <td style="{style_td_label}">Saldo Geral</td>
+                <td style="{style_td_valor} {saldo_color_style}">{saldo_geral:.2f}</td>
+            </tr>
+        </tbody>
     </table>
     """
+
+def criar_excel_completo(df_detalhado, df_resumo, caminho_arquivo):
+    """
+    (MODIFICADO) Salva um arquivo Excel com duas abas:
+    1. Relatorio Detalhado: Com todos os lançamentos de horas.
+    2. Resumo de Horas: Com o resumo por profissional.
+    """
+    print(f"Criando arquivo Excel completo (Detalhado e Resumo) em: {caminho_arquivo}")
+
+    colunas_desejadas = [
+        'Data', 'Projeto', 'Profissional', 'Horas', 
+        'Situação', 'Atividade', 'Descrição'
+    ]
+    colunas_existentes = [col for col in colunas_desejadas if col in df_detalhado.columns]
+    df_para_excel_detalhado = df_detalhado[colunas_existentes]
+
+    try:
+        with pd.ExcelWriter(caminho_arquivo, engine='xlsxwriter', datetime_format='dd/mm/yyyy') as writer:
+            # --- Aba 1: Relatório Detalhado ---
+            df_para_excel_detalhado.to_excel(writer, sheet_name='Relatorio Detalhado', index=False)
+            worksheet1 = writer.sheets['Relatorio Detalhado']
+            
+            # --- Aba 2: Resumo de Horas ---
+            df_resumo.to_excel(writer, sheet_name='Resumo de Horas', index=False)
+            worksheet2 = writer.sheets['Resumo de Horas']
+            
+            # --- Formatações ---
+            workbook = writer.book
+            header_format = workbook.add_format({
+                'bold': True, 'text_wrap': True, 'valign': 'top',
+                'fg_color': '#4472C4', 'font_color': 'white', 'border': 1
+            })
+
+            # Formatação Aba 1
+            for col_num, value in enumerate(df_para_excel_detalhado.columns.values):
+                worksheet1.write(0, col_num, value, header_format)
+            for i, col in enumerate(df_para_excel_detalhado.columns):
+                column_len = max(df_para_excel_detalhado[col].astype(str).map(len).max(), len(col)) + 3
+                worksheet1.set_column(i, i, min(column_len, 50))
+            
+            # Formatação Aba 2
+            for col_num, value in enumerate(df_resumo.columns.values):
+                worksheet2.write(0, col_num, value, header_format)
+            
+            red_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+            green_format = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
+            saldo_col_index = df_resumo.columns.get_loc('Total Saldo')
+            worksheet2.conditional_format(1, saldo_col_index, len(df_resumo), saldo_col_index,
+                                         {'type': 'cell', 'criteria': '<', 'value': 0, 'format': red_format})
+            worksheet2.conditional_format(1, saldo_col_index, len(df_resumo), saldo_col_index,
+                                         {'type': 'cell', 'criteria': '>', 'value': 0, 'format': green_format})
+
+            for i, col in enumerate(df_resumo.columns):
+                column_len = max(df_resumo[col].astype(str).map(len).max(), len(col)) + 3
+                worksheet2.set_column(i, i, column_len)
+        
+        print("Arquivo Excel completo criado com sucesso.")
+        return caminho_arquivo
+    except Exception as e:
+        print(f"ERRO ao criar o arquivo Excel: {e}")
+        raise

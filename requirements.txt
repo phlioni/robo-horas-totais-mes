@@ -4,3 +4,4 @@ selenium
 pywin32
 premailer
 holidays
+xlsxwriter

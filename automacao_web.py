@@ -14,7 +14,7 @@ import config
 def login_e_download(period_button_text="Mês Corrente"):
     """Orquestra a automação web: login, navegação e download usando o filtro especificado."""
     options = webdriver.ChromeOptions()
-    # options.add_argument("--headless") 
+    options.add_argument("--headless") 
     options.add_argument("--start-maximized")
     options.add_experimental_option('excludeSwitches', ['enable-logging'])
     driver = webdriver.Chrome(options=options)
